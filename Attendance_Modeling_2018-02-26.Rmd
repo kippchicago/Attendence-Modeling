@@ -1,0 +1,402 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+---
+title: "Bayes Implementation"
+output: html_document
+---
+
+```{r packages, include = FALSE}
+library(tidyverse)
+library(silounloadr)
+library(kippcolors)
+library(janitor)
+library(recipes)
+library(tidymodels)
+library(brms)
+library(tidybayes)
+library(loo)
+theme_set(theme_kipp_light())
+bigrquery::set_service_token("kipp-chicago-silo-2-aa786970aefd.json")
+```
+
+
+```{r knitr_options, results='hide', echo=FALSE}
+knitr::opts_knit$set(comment = FALSE,
+                     warning = FALSE, 
+                     progress = FALSE, 
+                     verbose = FALSE
+                     )
+```
+
+```{r att_mem_tables, cache=TRUE, results='hide', echo=FALSE}
+membership <- get_powerschool("ps_membership_reg") %>% 
+  select(studentid,
+         schoolid,
+         date = calendardate,
+         enrolled = studentmembership,
+         grade_level,
+         attendance = ATT_CalcCntPresentAbsent,
+         yearid) %>%
+  filter(yearid >= 25)
+attendance <- get_powerschool("attendance") %>% 
+  filter(yearid >= 25,
+        att_mode_code == "ATT_ModeDaily") 
+attendance_code <- get_powerschool("attendance_code") %>%
+  mutate(att_code = if_else(att_code == "true", "T", att_code)) %>% 
+  select(attendance_codeid = id,
+         att_code)
+  
+  
+```
+
+
+```{r students, cache=TRUE, include=FALSE}
+students <- get_powerschool("students") %>% 
+  select(studentid = id, 
+         student_number,
+         gender,
+         entrydate,
+         schoolentrydate,
+         districtentrydate,
+         geocode) %>%
+  collect()
+  
+```
+
+
+```{r joining_tables, results='hide', echo=FALSE, cache=TRUE}
+member_att <- membership %>% 
+  dplyr::left_join(attendance %>% 
+              select(-schoolid,
+                        -yearid) %>% 
+              dplyr::left_join(attendance_code,
+                        by = "attendance_codeid"),
+            by = c("studentid",
+                   "date" = "att_date")) %>% 
+  collect()
+```
+
+```{r recoding, results='hide', echo=FALSE}
+student_att <- member_att %>%
+  mutate(enrolled0 = 1,
+         enrolled = if_else(att_code == "D" & !is.na(att_code), 0, enrolled0),
+         present0 = ifelse(is.na(att_code), 1, 0),
+         present1 = ifelse(att_code %in%  c("A", "S"), 0, present0),
+         present2 = ifelse(att_code == "H", 0.5, present1),
+         present3 = ifelse(att_code %in% c("T", "E", "I"), 1, present2),
+         present = ifelse(is.na(present2), 1, present3),
+         absent = (1 - present)*enrolled,
+         tardy = ifelse(att_code %in% "T", 1, 0),
+         dna0 = if_else(att_code == "D", 1, 0),
+         dna = if_else(is.na(dna0), 0, dna0)) %>%
+  select(yearid,
+         schoolid,
+         studentid,
+         grade_level,
+         date,
+         att_code,
+         enrolled,
+         present,
+         absent,
+         tardy,
+         dna)
+```
+
+
+
+```{r cumulative quantities of interest}
+yearly_ada <- student_att %>% 
+  filter(yearid < 28) %>%
+  group_by(yearid,
+           studentid) %>% 
+  summarize(enrolled = sum(enrolled),
+            absent = sum(absent),
+            year_end = 1 - (absent/enrolled))
+ 
+cum_ada <- student_att %>% 
+  filter(yearid < 28) %>%
+  group_by(yearid,
+           studentid) %>% 
+  arrange(date) %>% 
+  mutate(cum_enrolled = cumsum(enrolled),
+         cum_absent = cumsum(absent),
+         running_ada = 1 - (cum_absent/cum_enrolled)) %>% 
+  filter(cum_enrolled > 0)
+yearly_cum_ada <- cum_ada %>% 
+  select(yearid,
+         schoolid,
+         grade_level,
+         studentid,
+         date,
+         cum_enrolled,
+         cum_absent,
+         running_ada) %>% 
+  dplyr::left_join(yearly_ada %>% 
+              select(-c(enrolled,
+                        absent)),
+            by = c("yearid",
+                   "studentid"))
+```
+
+
+```{r dec_subset}
+year_end_date <- yearly_cum_ada %>% 
+  group_by(yearid) %>% 
+  select(date) %>% 
+  distinct() %>% 
+  filter(date == max(date))
+dec_dates <- yearly_cum_ada %>% 
+  group_by(yearid) %>% 
+  select(date) %>% 
+  distinct() %>% 
+  filter(lubridate::month(date) == 12) %>% 
+  filter(date == max(date))
+yca_filtered_dec <- yearly_cum_ada %>% 
+  inner_join(dec_dates %>% 
+               ungroup() %>% 
+               select(-yearid),
+             by = c("date")) %>%
+  ungroup() %>%
+  mutate(yearid = as.factor(yearid),
+         schoolid = as.factor(schoolid))
+yca_filtered_yr_end <- yearly_cum_ada %>% 
+  inner_join(year_end_date %>% 
+               ungroup() %>% 
+               select(-yearid),
+             by = c("date")) %>%
+  ungroup() %>%
+  mutate(yearid = as.factor(yearid),
+         schoolid = as.factor(schoolid)) %>% 
+  select(yearid,
+         schoolid,
+         studentid,
+         yr_end_enrolled = cum_enrolled,
+         yr_end_absent = cum_absent)
+yca_filtered <- yca_filtered_dec %>% 
+  inner_join(yca_filtered_yr_end,
+             by = c("yearid",
+                    "schoolid",
+                    "studentid")) %>% 
+  mutate(yr_end_present = yr_end_enrolled - yr_end_absent,
+         cum_present = cum_enrolled - cum_absent)
+```
+
+
+```{r recipes}
+yca_cont <- yca_filtered %>% #continuous var only
+  select(-c(yearid,
+            grade_level,
+            date)) %>% 
+  mutate(studentid = as_factor(studentid))
+
+bayes_recipe <- yca_cont %>% 
+  recipe(year_end ~ .) %>% 
+  step_center(all_predictors(), -schoolid, -studentid) %>% 
+  step_scale(all_predictors(),-schoolid, -studentid) %>% 
+  prep()
+
+bayes_data <- bayes_recipe %>% 
+  juice()
+
+bayes_data
+```
+
+
+```{r}
+fit1 <- brm(year_end ~ cum_enrolled + cum_absent + (1|schoolid),
+            bayes_data,
+            family = gaussian(link = "identity"), 
+            iter = 1000,
+            cores = 4)
+
+plot(fit1)
+```
+
+```{r}
+fit1_beta <- brm(year_end ~ cum_enrolled + cum_absent + (1|schoolid),
+            bayes_data,
+            family = zero_one_inflated_beta(), 
+            iter = 1000,
+            cores = 4)
+
+#plot(fit1_beta)
+```
+
+
+```{r}
+fit2 <- brm(year_end ~ cum_enrolled + cum_absent + (1 + cum_enrolled + cum_absent|schoolid),
+            bayes_data,
+            family = gaussian(link = "identity"), 
+            thin = 10, 
+            iter = 1000,
+            cores = 4)
+
+
+plot(fit2)
+```
+
+```{r}
+get_variables(fit1)
+get_variables(fit2)
+
+```
+```{r}
+
+fit2 %>%
+  spread_draws(b_Intercept, b_cum_enrolled, b_cum_absent, r_schoolid[school,term]) %>%
+  mean_qi()
+```
+
+```{r}
+fit_1_draws <- bayes_data %>%
+  #modelr::data_grid(cum_absent, cum_enrolled, schoolid) %>%
+  add_predicted_draws(fit1) 
+
+fit_1_draws %>%
+  ggplot(aes(x=.prediction, y=schoolid)) +
+  ggridges::geom_density_ridges()
+
+```
+
+
+```{r}
+fit_2_draws <- bayes_data %>%
+  #modelr::data_grid(cum_absent, cum_enrolled, schoolid) %>%
+  add_predicted_draws(fit2) 
+
+fit_2_draws %>%
+  ggplot(aes(x=.prediction, y=schoolid)) +
+  ggridges::geom_density_ridges() +
+  geom_vline(aes(xintercept = .975), color = "hotpink")
+  #ggridges::geom_vridgeline()
+
+```
+```{r}
+fit_2_posterior_predictions <- bayes_data %>%
+  #modelr::data_grid(cum_absent, cum_enrolled, schoolid) %>%
+  add_predicted_draws(fit2) 
+```
+```{r}
+
+#sample_mean_year_end<-bayes_recipe$steps[[1]]$means[["year_end"]]
+
+#sample_sd_year_end<-bayes_recipe$steps[[2]]$sds[["year_end"]]
+
+#fit_2_posterior_predictions<-fit_2_posterior_predictions %>% mutate(adj_preds = (.prediction * #sample_sd_year_end)+sample_mean_year_end)
+
+fit_2_posterior_predictions_ada <- fit_2_posterior_predictions %>%
+  group_by(schoolid) %>%
+ mean_qi(.prediction)  
+
+fit_2_posterior_predictions %>%
+  ggplot(aes(x = .prediction)) +
+   geom_density(aes(fill = schoolid)) +
+  geom_vline(data = fit_2_posterior_predictions_ada,
+             aes(xintercept = .prediction))+
+  facet_grid(schoolid~.)
+
+
+fit_2_posterior_predictions %>%
+  ggplot(aes(x=.prediction, y=schoolid)) +
+  ggridges::geom_density_ridges() +
+  geom_vline(aes(xintercept = .975), color = "hotpink")
+
+   
+```
+```{r beta}
+fit2_beta <- brm(year_end ~ cum_enrolled + cum_absent + (1 + cum_enrolled + cum_absent|schoolid),
+            bayes_data, 
+            family = zero_one_inflated_beta(), 
+            thin = 10, 
+            iter = 2000,
+            cores = 4)
+
+
+plot(fit2_beta)
+
+fit_2__beta_posterior_predictions <- bayes_data %>%
+  #modelr::data_grid(cum_absent, cum_enrolled, schoolid) %>%
+  add_predicted_draws(fit2_beta) 
+
+fit_2__beta_posterior_predictions %>%
+  ggplot(aes(x=.prediction, y=schoolid)) +
+  ggridges::geom_density_ridges() +
+  geom_vline(aes(xintercept = .975), color = "hotpink") +
+  geom_vline(aes(xintercept = .96), color = "lightpink")
+
+```
+
+```{r}
+
+x<- fit_2__beta_posterior_predictions %>%
+  group_by(schoolid) %>%
+  do(tibble(.prediction = quantile(.$.prediction, ppoints(100))))
+
+
+p<-x %>% 
+  mutate(color = case_when(
+    .prediction >= .975 ~ kipp_colors$darkorange,
+    .prediction >= .96 ~ kipp_colors$lightorange,
+    
+    TRUE ~ kipp_colors$gray
+  )) %>%
+  
+  ggplot(aes(x = .prediction, fill = color)) +
+  geom_dotplot(binwidth = .005, color = NA) +
+  geom_vline(aes(xintercept = .975), color = kipp_colors$darkorange) +
+  geom_vline(aes(xintercept = .96), color = kipp_colors$lightorange) +
+  facet_grid(rows = vars(schoolid), switch = "y") +
+  facet_title_left_horizontal() +
+  scale_fill_identity() +
+  scale_y_continuous(breaks = NULL)  +
+  labs(y = "") 
+  
+ #plotly::ggplotly(p) 
+p
+```
+
+
+
+
+```{r loo}
+#options(mc.cores = 4)
+loo_fit1 <- loo(fit1, reloo = F)
+loo_fit1_beta <- loo(fit1_beta, reloo = F)
+loo_fit2 <- loo(fit2, reloo = F)
+loo_fit2_beta <- loo(fit2_beta, reloo = F)
+
+loo_compare(loo_fit1, loo_fit1_beta, loo_fit2, loo_fit2_beta)
+```
+
+Thes data and models favor model `fit2`:
+```{r}
+x<- fit_2_posterior_predictions %>%
+  group_by(schoolid) %>%
+  do(tibble(.prediction = quantile(.$.prediction, ppoints(100))))
+
+
+p<-x %>% 
+  mutate(color = case_when(
+    .prediction >= .975 ~ kipp_colors$darkorange,
+    .prediction >= .96 ~ kipp_colors$lightorange,
+    
+    TRUE ~ kipp_colors$gray
+  )) %>%
+  
+  ggplot(aes(x = .prediction, fill = color)) +
+  geom_dotplot(binwidth = .005, color = NA) +
+  geom_vline(aes(xintercept = .975), color = kipp_colors$darkorange) +
+  geom_vline(aes(xintercept = .96), color = kipp_colors$lightorange) +
+  facet_grid(rows = vars(schoolid), switch = "y") +
+  facet_title_left_horizontal() +
+  scale_fill_identity() +
+  scale_y_continuous(breaks = NULL)  +
+  labs(y = "") 
+  
+ plotly::ggplotly(p) 
+p
+```
+
