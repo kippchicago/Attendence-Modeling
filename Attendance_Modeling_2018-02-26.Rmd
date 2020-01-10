@@ -7,7 +7,6 @@ output: html_notebook
 title: "Bayes Implementation"
 output: html_document
 ---
-
 ```{r packages, include = FALSE}
 library(tidyverse)
 library(silounloadr)
