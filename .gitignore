@@ -1,5 +1,7 @@
+## Ignore temp files 
+*~
+## Ignore .hhtr_oauth files
 .httr-oauth
 .Rproj.user
 .Rhistory
 kipp-chicago-silo*.json
-*.nb.html
